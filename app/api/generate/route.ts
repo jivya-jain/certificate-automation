@@ -1,3 +1,5 @@
+import { prisma } from "@/lib/prisma";
+
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs";
 import path from "path";
@@ -13,7 +15,6 @@ function runPowerShell(args: string[]): Promise<string> {
     const scriptPath = path.join(process.cwd(), "scripts", "convert-pptx.ps1");
     const formattedArgs = args.map((arg) => `"${arg.replace(/"/g, '`"')}"`).join(" ");
     const command = `powershell -ExecutionPolicy Bypass -File "${scriptPath}" ${formattedArgs}`;
-
     exec(command, (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || error.message));
@@ -24,6 +25,7 @@ function runPowerShell(args: string[]): Promise<string> {
   });
 }
 
+// Helper to sanitize file names
 function sanitizeFileName(value: string) {
   return (
     value
@@ -46,33 +48,41 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "templateId is required" }, { status: 400 });
     }
 
-    const templatesDir = path.join(process.cwd(), "templates");
-    const templatePath = path.join(templatesDir, `${templateId}.pptx`);
-
+    const templatePath = path.join(process.cwd(), "templates", `${templateId}.pptx`);
     if (!fs.existsSync(templatePath)) {
-      return NextResponse.json(
-        { error: `Template not found: ${templateId}` },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: `Template not found: ${templateId}` }, { status: 404 });
     }
 
     // Ensure temp directory exists
     fs.mkdirSync(tempDir, { recursive: true });
 
-    // Handle Bulk Generation
+    // Bulk generation
     if (records && Array.isArray(records)) {
       if (records.length === 0) {
         return NextResponse.json({ error: "Records array cannot be empty" }, { status: 400 });
       }
 
-      const batchItems = [];
+      // Import participants into Neon
+      for (const rec of records) {
+        const name = (rec.candidateName ?? "").trim();
+        const team = (rec.teamName ?? "").trim();
+        if (!name) continue;
+        try {
+          await prisma.participant.create({
+            data: { candidateName: name, teamName: team },
+          });
+        } catch (e) {
+          console.error("Error inserting participant", e);
+        }
+      }
+
+      const batchItems: { input: string; output: string; fileName: string }[] = [];
 
       for (let i = 0; i < records.length; i++) {
         const record = records[i];
         const recName = record.candidateName || "Candidate";
         const recTeam = record.teamName || "Team";
 
-        // Read template and process with docxtemplater
         const content = fs.readFileSync(templatePath);
         const zip = new PizZip(content);
         const doc = new Docxtemplater(zip, {
@@ -81,45 +91,35 @@ export async function POST(req: NextRequest) {
           delimiters: { start: "{{", end: "}}" },
         });
 
-        doc.render({
-          NAME: recName,
-          TEAM_NAME: recTeam,
-        });
-
+        doc.render({ NAME: recName, TEAM_NAME: recTeam });
         const buf = doc.getZip().generate({ type: "nodebuffer" });
-        const recordPptxPath = path.join(tempDir, `record_${i}.pptx`);
-        const recordPdfPath = path.join(tempDir, `record_${i}.pdf`);
-
-        fs.writeFileSync(recordPptxPath, buf);
+        const pptxPath = path.join(tempDir, `record_${i}.pptx`);
+        const pdfPath = path.join(tempDir, `record_${i}.pdf`);
+        fs.writeFileSync(pptxPath, buf);
 
         batchItems.push({
-          input: recordPptxPath,
-          output: recordPdfPath,
+          input: pptxPath,
+          output: pdfPath,
           fileName: `${String(i + 1).padStart(2, "0")}-${sanitizeFileName(recName)}.pdf`,
         });
       }
 
-      // Write batch items config JSON for PowerShell script
       const batchJsonPath = path.join(tempDir, "batch.json");
       fs.writeFileSync(batchJsonPath, JSON.stringify(batchItems, null, 2));
 
-      // Run PowerPoint batch conversion
       console.log(`Running batch PDF conversion for ${records.length} items`);
       await runPowerShell(["-Action", "batch-pdf", "-BatchJsonPath", batchJsonPath]);
 
-      // Create ZIP archive
       const zipArchive = new JSZip();
       for (const item of batchItems) {
         if (fs.existsSync(item.output)) {
-          const fileData = fs.readFileSync(item.output);
-          zipArchive.file(item.fileName, fileData);
+          zipArchive.file(item.fileName, fs.readFileSync(item.output));
         } else {
           console.error(`Expected output PDF not found: ${item.output}`);
         }
       }
 
       const zipBlob = await zipArchive.generateAsync({ type: "nodebuffer" });
-
       return new NextResponse(zipBlob, {
         headers: {
           "Content-Type": "application/zip",
@@ -128,9 +128,23 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Handle Single Generation
+    // Single generation
     if (!candidateName) {
       return NextResponse.json({ error: "candidateName is required" }, { status: 400 });
+    }
+
+    // Verify participant exists
+    const participant = await prisma.participant.findFirst({
+      where: {
+        candidateName: { equals: candidateName.trim(), mode: "insensitive" },
+        teamName: { equals: (teamName ?? "").trim(), mode: "insensitive" },
+      },
+    });
+    if (!participant) {
+      return NextResponse.json(
+        { error: "Participant not found. Please ensure the name and team are registered." },
+        { status: 400 }
+      );
     }
 
     const content = fs.readFileSync(templatePath);
@@ -141,34 +155,20 @@ export async function POST(req: NextRequest) {
       delimiters: { start: "{{", end: "}}" },
     });
 
-    doc.render({
-      NAME: candidateName,
-      TEAM_NAME: teamName || "",
-    });
-
+    doc.render({ NAME: candidateName, TEAM_NAME: teamName || "" });
     const buf = doc.getZip().generate({ type: "nodebuffer" });
-    const singlePptxPath = path.join(tempDir, "output.pptx");
-    const singlePdfPath = path.join(tempDir, "output.pdf");
+    const pptxPath = path.join(tempDir, "output.pptx");
+    const pdfPath = path.join(tempDir, "output.pdf");
+    fs.writeFileSync(pptxPath, buf);
 
-    fs.writeFileSync(singlePptxPath, buf);
-
-    // Convert to PDF
     console.log(`Converting single PPTX to PDF for: ${candidateName}`);
-    await runPowerShell([
-      "-Action",
-      "pdf",
-      "-InputPath",
-      singlePptxPath,
-      "-OutputPath",
-      singlePdfPath,
-    ]);
+    await runPowerShell(["-Action", "pdf", "-InputPath", pptxPath, "-OutputPath", pdfPath]);
 
-    if (!fs.existsSync(singlePdfPath)) {
+    if (!fs.existsSync(pdfPath)) {
       throw new Error("PDF generation output was not created");
     }
 
-    const pdfBuffer = fs.readFileSync(singlePdfPath);
-
+    const pdfBuffer = fs.readFileSync(pdfPath);
     return new NextResponse(pdfBuffer, {
       headers: {
         "Content-Type": "application/pdf",
@@ -182,7 +182,7 @@ export async function POST(req: NextRequest) {
       { status: 500 }
     );
   } finally {
-    // Synchronously clean up temporary directory recursively
+    // Clean up temp directory
     try {
       if (fs.existsSync(tempDir)) {
         fs.rmSync(tempDir, { recursive: true, force: true });
@@ -190,5 +190,6 @@ export async function POST(req: NextRequest) {
     } catch (cleanupError) {
       console.error("Error cleaning up temporary files:", cleanupError);
     }
+    //await prisma.$disconnect();
   }
 }
